@@ -7,7 +7,6 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
-	"strconv"
 	"time"
 
 	"net/mail"
@@ -16,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -32,7 +32,7 @@ func (s *Server) RegisterRoutes() http.Handler {
 	}))
 
 	r.Get("/", s.HelloWorldHandler)
-	r.Post("/api/v1/user/login", s.Login)
+	r.With(s.RateLimitMiddleware).Post("/api/v1/user/login", s.Login)
 	return r
 }
 
@@ -68,6 +68,7 @@ func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, "Invaild Body")
 		return
 	}
+	req.Id = "dfe1e2e3-50c7-4a06-b122-e439294955b1"
 	num := rand.Intn(900000) + 100000
 	generatedUsername := fmt.Sprintf("user%d", num)
 
@@ -86,28 +87,7 @@ func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var counter int
-
-	id := "dfe1e2e3-50c7-4a06-b122-e439294955b1"
-	req.Id = id
 	if req.Password != "123random" {
-		counter++
-		inrCounter, err := s.redis.Incr(r.Context(), "mismatch_cnt:"+req.Id).Result()
-		fmt.Printf("Counter Increment %s : %d", req.Id, inrCounter)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-		getCounter, err := s.redis.Get(r.Context(), "mismatch_cnt:"+req.Id).Result()
-		checkCounter, err := strconv.Atoi(getCounter)
-		log.Println("getCounter: ", getCounter)
-		if err != nil {
-			panic(err)
-		}
-		if checkCounter > 3 {
-			go sendEmailJob(req.Id)
-			return
-		}
 		writeJSON(w, http.StatusBadRequest, "Authentication failed")
 		return
 	}
@@ -120,8 +100,15 @@ func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
 	s.redis.Set(r.Context(), "user_auth:"+sessionId, req.Id, time.Hour).Result()
 	log.Println("session stored in redis")
 
+	getId, err := s.redis.HGetAll(r.Context(), "user_auth").Result()
+	if err != nil {
+		panic(err)
+	}
+
+	log.Printf("user auth: %s", getId)
+
 	writeJSON(w, http.StatusAccepted, UserResponse{
-		Id:         id,
+		Id:         req.Id,
 		Username:   req.Username,
 		Email:      req.Email,
 		Created_at: req.Created_at,
@@ -129,8 +116,48 @@ func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
 
 }
 
+func (s *Server) RateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := r.RemoteAddr
+		key := "rate_limit:" + ip
+		cnt, err := s.redis.Get(r.Context(), key).Int()
+		if err != nil && err != redis.Nil {
+			writeJSON(w, http.StatusInternalServerError, "server error")
+			return
+		}
+		if cnt >= 3 {
+			writeJSON(w, http.StatusTooManyRequests, "Too many request. try again later")
+			return
+		}
+
+		if cnt <= 3 {
+			inrCounter, err := s.redis.Incr(r.Context(), key).Result()
+			fmt.Printf("Counter Increment %s : %d", key, inrCounter)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+		}
+
+		if cnt == 1 {
+			_, err := s.redis.Expire(r.Context(), key, time.Minute*1).Result()
+			if err != nil {
+				panic(err)
+			}
+		}
+
+		if cnt > 3 {
+			go sendEmailJob(key)
+			writeJSON(w, http.StatusTooManyRequests, "Too many request. try again later")
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 func sendEmailJob(id string) {
-	log.Printf("Sending email to id %s to reset the password", id)
+	log.Printf("Sending email to ip %s to reset the password", id)
 }
 
 func decodeJSONStrict(r *http.Request, v any) error {
