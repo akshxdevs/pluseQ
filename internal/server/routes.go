@@ -7,11 +7,16 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"strconv"
+	"time"
+
+	"net/mail"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func (s *Server) RegisterRoutes() http.Handler {
@@ -27,9 +32,7 @@ func (s *Server) RegisterRoutes() http.Handler {
 	}))
 
 	r.Get("/", s.HelloWorldHandler)
-	r.Post("/api/v1/user/signup", s.Signup)
 	r.Post("/api/v1/user/login", s.Login)
-	r.Post("api/v1/user/send-email/{id}", s.SendEmail)
 	return r
 }
 
@@ -45,32 +48,89 @@ func (s *Server) HelloWorldHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(jsonResp)
 }
 
-func (s *Server) Signup(w http.ResponseWriter, r *http.Request) {
-	type User struct {
-		Id       string `json:"-"`
-		Username string `json:"-"`
-		Email    string `json:"email"`
-		Password string `json:"password"`
+func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
+	type UserRequest struct {
+		Id         string `json:"id"`
+		Username   string `json:"username"`
+		Email      string `json:"email"`
+		Password   string `json:"password"`
+		Created_at string `json:"created_at"`
+	}
+	type UserResponse struct {
+		Id         string `json:"id"`
+		Username   string `json:"username"`
+		Email      string `json:"email"`
+		Created_at string `json:"created_at"`
 	}
 
-	var req User
+	var req UserRequest
 	if err := decodeJSONStrict(r, &req); err != nil {
-
+		writeJSON(w, http.StatusBadRequest, "Invaild Body")
+		return
 	}
 	num := rand.Intn(900000) + 100000
 	generatedUsername := fmt.Sprintf("user%d", num)
 
 	req.Username = generatedUsername
-	req.Id = uuid.NewString()
+	// req.Id = uuid.NewString()
+
+	req.Created_at = time.Now().UTC().String()
+
+	if req.Email == "" || req.Password == "" {
+		writeJSON(w, http.StatusBadRequest, "Invaild Credencials")
+		return
+	}
+
+	if _, err := mail.ParseAddress(req.Email); err != nil {
+		writeJSON(w, http.StatusBadRequest, "Invalid email")
+		return
+	}
+
+	var counter int
+
+	id := "dfe1e2e3-50c7-4a06-b122-e439294955b1"
+	req.Id = id
+	if req.Password != "123random" {
+		counter++
+		inrCounter, err := s.redis.Incr(r.Context(), "mismatch_cnt:"+req.Id).Result()
+		fmt.Printf("Counter Increment %s : %d", req.Id, inrCounter)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		getCounter, err := s.redis.Get(r.Context(), "mismatch_cnt:"+req.Id).Result()
+		checkCounter, err := strconv.Atoi(getCounter)
+		log.Println("getCounter: ", getCounter)
+		if err != nil {
+			panic(err)
+		}
+		if checkCounter > 3 {
+			go sendEmailJob(req.Id)
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, "Authentication failed")
+		return
+	}
+
+	_, err := bcrypt.GenerateFromPassword([]byte(req.Password), 10)
+	if err != nil {
+		panic(err)
+	}
+	sessionId := uuid.NewString()
+	s.redis.Set(r.Context(), "user_auth:"+sessionId, req.Id, time.Hour).Result()
+	log.Println("session stored in redis")
+
+	writeJSON(w, http.StatusAccepted, UserResponse{
+		Id:         id,
+		Username:   req.Username,
+		Email:      req.Email,
+		Created_at: req.Created_at,
+	})
 
 }
 
-func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
-
-}
-
-func (s *Server) SendEmail(w http.ResponseWriter, r *http.Request) {
-
+func sendEmailJob(id string) {
+	log.Printf("Sending email to id %s to reset the password", id)
 }
 
 func decodeJSONStrict(r *http.Request, v any) error {
