@@ -118,6 +118,7 @@ func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) RateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		const maxAttempts = 4
 		ip := r.RemoteAddr
 		key := "rate_limit:" + ip
 		cnt, err := s.redis.Get(r.Context(), key).Int()
@@ -125,18 +126,24 @@ func (s *Server) RateLimitMiddleware(next http.Handler) http.Handler {
 			writeJSON(w, http.StatusInternalServerError, "server error")
 			return
 		}
-		if cnt >= 3 {
-			writeJSON(w, http.StatusTooManyRequests, "Too many request. try again later")
+
+		inrCounter, err := s.redis.Incr(r.Context(), key).Result()
+		fmt.Printf("Counter Increment %d", inrCounter)
+		if err != nil {
+			log.Println(err)
 			return
 		}
 
-		if cnt <= 3 {
-			inrCounter, err := s.redis.Incr(r.Context(), key).Result()
-			fmt.Printf("Counter Increment %s : %d", key, inrCounter)
-			if err != nil {
-				log.Println(err)
-				return
+		if cnt > maxAttempts {
+			if cnt == maxAttempts+1 {
+				go func() {
+					if err := s.enqueueEmailJob(r.Context(), EmailJob{IP: ip, Reason: "rate_limit"}); err != nil {
+						log.Printf("failed to enqueue email job: %v", err)
+					}
+				}()
 			}
+			writeJSON(w, http.StatusTooManyRequests, "Too many request. try again later")
+			return
 		}
 
 		if cnt == 1 {
@@ -145,20 +152,10 @@ func (s *Server) RateLimitMiddleware(next http.Handler) http.Handler {
 				panic(err)
 			}
 		}
-
-		if cnt > 3 {
-			go sendEmailJob(key)
-			writeJSON(w, http.StatusTooManyRequests, "Too many request. try again later")
-			return
-		}
-
 		next.ServeHTTP(w, r)
 	})
 }
 
-func sendEmailJob(id string) {
-	log.Printf("Sending email to ip %s to reset the password", id)
-}
 
 func decodeJSONStrict(r *http.Request, v any) error {
 	dec := json.NewDecoder(r.Body)

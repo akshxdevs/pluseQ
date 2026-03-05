@@ -12,7 +12,7 @@ import (
 	"pluse-q/internal/server"
 )
 
-func gracefulShutdown(apiServer *http.Server, done chan bool) {
+func gracefulShutdown(apiServer *http.Server, cleanup func(), done chan bool) {
 	// Create context that listens for the interrupt signal from the OS.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -31,6 +31,8 @@ func gracefulShutdown(apiServer *http.Server, done chan bool) {
 		log.Printf("Server forced to shutdown with error: %v", err)
 	}
 
+	cleanup()
+
 	log.Println("Server exiting")
 
 	// Notify the main goroutine that the shutdown is complete
@@ -39,15 +41,15 @@ func gracefulShutdown(apiServer *http.Server, done chan bool) {
 
 func main() {
 
-	server := server.NewServer()
-	log.Printf("starting server on port %s", server.Addr)
+	srv, cleanup := server.NewServer()
+	log.Printf("starting server on port %s", srv.Addr)
 	// Create a done channel to signal when the shutdown is complete
 	done := make(chan bool, 1)
 
 	// Run graceful shutdown in a separate goroutine
-	go gracefulShutdown(server, done)
+	go gracefulShutdown(srv, cleanup, done)
 
-	err := server.ListenAndServe()
+	err := srv.ListenAndServe()
 	if err != nil && err != http.ErrServerClosed {
 		panic(fmt.Sprintf("http server error: %s", err))
 	}
