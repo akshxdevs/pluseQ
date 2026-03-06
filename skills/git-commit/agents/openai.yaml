@@ -1,4 +1,0 @@
-interface:
-  display_name: "Commit Unstaged Changes"
-  short_description: "Commit unstaged Git files with concise professional messages"
-  default_prompt: "Stage unstaged files, write a professional commit message under 20 words, and commit only those files."

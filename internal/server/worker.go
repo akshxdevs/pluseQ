@@ -45,11 +45,11 @@ func (s *Server) sendToDLQ(ctx context.Context, job EmailJob, reason string) {
 	err := s.redis.XAdd(ctx, &redis.XAddArgs{
 		Stream: emailDLQ,
 		Values: map[string]any{
-			"ip":         job.IP,
-			"reason":     job.Reason,
-			"attempts":   job.Attempts,
-			"failure":    reason,
-			"failed_at":  time.Now().UTC().String(),
+			"ip":        job.IP,
+			"reason":    job.Reason,
+			"attempts":  job.Attempts,
+			"failure":   reason,
+			"failed_at": time.Now().UTC().String(),
 		},
 	}).Err()
 	if err != nil {
@@ -60,7 +60,7 @@ func (s *Server) sendToDLQ(ctx context.Context, job EmailJob, reason string) {
 }
 
 func (s *Server) processEmailJob(job EmailJob) error {
-	// real email sending logic goes here
+
 	log.Printf("sending email for ip %s (attempt %d)", job.IP, job.Attempts)
 	return nil
 }
@@ -89,7 +89,6 @@ func (s *Server) StartWorker(ctx context.Context) {
 			if err == redis.Nil {
 				continue
 			}
-			// context cancelled — exit cleanly
 			if ctx.Err() != nil {
 				return
 			}
