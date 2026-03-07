@@ -42,7 +42,7 @@ func (s *Server) enqueueEmailJob(ctx context.Context, job EmailJob) error {
 }
 
 func (s *Server) sendToDLQ(ctx context.Context, job EmailJob, reason string) {
-	err := s.redis.XAdd(ctx, &redis.XAddArgs{
+	dlq, err := s.redis.XAdd(ctx, &redis.XAddArgs{
 		Stream: emailDLQ,
 		Values: map[string]any{
 			"ip":        job.IP,
@@ -51,16 +51,16 @@ func (s *Server) sendToDLQ(ctx context.Context, job EmailJob, reason string) {
 			"failure":   reason,
 			"failed_at": time.Now().UTC().String(),
 		},
-	}).Err()
+	}).Result()
 	if err != nil {
 		log.Printf("failed to send job to DLQ: %v", err)
 		return
 	}
+	log.Printf("DLQ: %s", dlq)
 	log.Printf("job for ip %s sent to DLQ after %d attempts", job.IP, job.Attempts)
 }
 
 func (s *Server) processEmailJob(job EmailJob) error {
-
 	log.Printf("sending email for ip %s (attempt %d)", job.IP, job.Attempts)
 	return nil
 }
@@ -97,6 +97,7 @@ func (s *Server) StartWorker(ctx context.Context) {
 		}
 
 		for _, stream := range streams {
+			log.Println(len(stream.Stream))
 			for _, msg := range stream.Messages {
 				s.handleMessage(ctx, msg)
 			}
@@ -112,21 +113,36 @@ func (s *Server) handleMessage(ctx context.Context, msg redis.XMessage) {
 		Attempts: attempts + 1,
 	}
 
-	err := s.processEmailJob(job)
-	if err == nil {
-		s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
-		return
-	}
+	log.Printf("Attempts: %d", job.Attempts)
+	log.Println("job: ", job)
 
-	log.Printf("job failed for ip %s: %v (attempt %d/%d)", job.IP, err, job.Attempts, maxRetries)
+	jobTimeout, cancel := context.WithTimeout(ctx, time.Second*30)
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- s.processEmailJob(job)
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			log.Printf("job done for ip %s, acking", job.IP)
+			s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
+			return
+		}
+		log.Printf("job error for ip %s: %v", job.IP, err)
+	case <-jobTimeout.Done():
+		log.Printf("job timed out for ip %s (attempt %d/%d)", job.IP, job.Attempts, maxRetries)
+	}
 
 	if job.Attempts >= maxRetries {
 		s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
-		s.sendToDLQ(ctx, job, err.Error())
+		s.sendToDLQ(ctx, job, "timeout or error")
 		return
 	}
 
-	// re-enqueue with updated attempt count
 	s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
 	if err := s.enqueueEmailJob(ctx, job); err != nil {
 		log.Printf("failed to re-enqueue job: %v", err)
