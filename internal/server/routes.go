@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -118,7 +119,7 @@ func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) RateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		const maxAttempts = 4
+		const maxAttempts = 2
 		ip := r.RemoteAddr
 		key := "rate_limit:" + ip
 		cnt, err := s.redis.Get(r.Context(), key).Int()
@@ -137,7 +138,7 @@ func (s *Server) RateLimitMiddleware(next http.Handler) http.Handler {
 		if cnt > maxAttempts {
 			if cnt == maxAttempts+1 {
 				go func() {
-					if err := s.enqueueEmailJob(r.Context(), EmailJob{IP: ip, Reason: "rate_limit"}); err != nil {
+					if err := s.enqueueEmailJob(context.Background(), EmailJob{IP: ip, Reason: "rate_limit"}); err != nil {
 						log.Printf("failed to enqueue email job: %v", err)
 					}
 				}()
@@ -147,7 +148,7 @@ func (s *Server) RateLimitMiddleware(next http.Handler) http.Handler {
 		}
 
 		if cnt == 1 {
-			_, err := s.redis.Expire(r.Context(), key, time.Minute*1).Result()
+			_, err := s.redis.Expire(r.Context(), key, time.Second*10).Result()
 			if err != nil {
 				panic(err)
 			}
@@ -155,7 +156,6 @@ func (s *Server) RateLimitMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
-
 
 func decodeJSONStrict(r *http.Request, v any) error {
 	dec := json.NewDecoder(r.Body)
