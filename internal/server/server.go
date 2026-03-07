@@ -14,8 +14,8 @@ import (
 )
 
 type Server struct {
-	port        int
-	redis       *redis.Client
+	port         int
+	redis        *redis.Client
 	workerCancel context.CancelFunc
 }
 
