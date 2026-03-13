@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -134,11 +136,17 @@ func (s *Server) RateLimitMiddleware(next http.Handler) http.Handler {
 			log.Println(err)
 			return
 		}
+		data := fmt.Sprintf("%s:%s",
+			ip,
+			"email_queue",
+		)
 
+		h := sha256.Sum256([]byte(data))
+		idempotencyKey := hex.EncodeToString(h[:])
 		if cnt > maxAttempts {
 			if cnt == maxAttempts+1 {
 				go func() {
-					if err := s.enqueueEmailJob(context.Background(), EmailJob{IP: ip, Reason: "rate_limit"}); err != nil {
+					if err := s.enqueueEmailJob(context.Background(), EmailJob{IP: ip, Reason: "rate_limit"}, idempotencyKey); err != nil {
 						log.Printf("failed to enqueue email job: %v", err)
 					}
 				}()
