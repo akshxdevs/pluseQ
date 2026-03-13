@@ -18,9 +18,10 @@ const (
 )
 
 type EmailJob struct {
-	IP       string
-	Reason   string
-	Attempts int
+	IP             string
+	Reason         string
+	Attempts       int
+	IdempotencyKey string
 }
 
 func (s *Server) ensureConsumerGroup(ctx context.Context) {
@@ -30,18 +31,30 @@ func (s *Server) ensureConsumerGroup(ctx context.Context) {
 	}
 }
 
-func (s *Server) enqueueEmailJob(ctx context.Context, job EmailJob) error {
+func (s *Server) enqueueEmailJob(ctx context.Context, job EmailJob, idemKey string) error {
+	ok, err := s.redis.SetNX(ctx, "email:idempotency:"+job.IP, idemKey, time.Second*10).Result()
+	if err != nil {
+		log.Println("redis error: idempotency check failed")
+		return err
+	}
+	if !ok {
+		log.Println("error: idempotency check failed")
+		return nil
+	}
+
 	return s.redis.XAdd(ctx, &redis.XAddArgs{
 		Stream: emailQueue,
 		Values: map[string]any{
-			"ip":       job.IP,
-			"reason":   job.Reason,
-			"attempts": job.Attempts,
+			"ip":              job.IP,
+			"reason":          job.Reason,
+			"attempts":        job.Attempts,
+			"idempotency_key": idemKey,
 		},
 	}).Err()
 }
 
 func (s *Server) sendToDLQ(ctx context.Context, job EmailJob, reason string) {
+
 	dlq, err := s.redis.XAdd(ctx, &redis.XAddArgs{
 		Stream: emailDLQ,
 		Values: map[string]any{
@@ -106,11 +119,14 @@ func (s *Server) StartWorker(ctx context.Context) {
 }
 
 func (s *Server) handleMessage(ctx context.Context, msg redis.XMessage) {
+	log.Println("message: ", msg)
 	attempts, _ := strconv.Atoi(msg.Values["attempts"].(string))
+	idempotencyKey, _ := msg.Values["idempotency_key"].(string)
 	job := EmailJob{
-		IP:       msg.Values["ip"].(string),
-		Reason:   msg.Values["reason"].(string),
-		Attempts: attempts + 1,
+		IP:             msg.Values["ip"].(string),
+		Reason:         msg.Values["reason"].(string),
+		Attempts:       attempts + 1,
+		IdempotencyKey: idempotencyKey,
 	}
 
 	log.Printf("Attempts: %d", job.Attempts)
@@ -121,6 +137,14 @@ func (s *Server) handleMessage(ctx context.Context, msg redis.XMessage) {
 
 	done := make(chan error, 1)
 
+	key := "email:sent:" + job.IP
+	exist, _ := s.redis.Get(ctx, key).Result()
+	if exist == "1" {
+		s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
+		log.Println("error: idempotency error")
+		return
+	}
+
 	go func() {
 		done <- s.processEmailJob(job)
 	}()
@@ -129,6 +153,8 @@ func (s *Server) handleMessage(ctx context.Context, msg redis.XMessage) {
 	case err := <-done:
 		if err == nil {
 			log.Printf("job done for ip %s, acking", job.IP)
+			log.Printf("idempotency: initialized with key: %s", idempotencyKey)
+			s.redis.Set(ctx, key, "1", 30*time.Second)
 			s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
 			return
 		}
@@ -144,7 +170,7 @@ func (s *Server) handleMessage(ctx context.Context, msg redis.XMessage) {
 	}
 
 	s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
-	if err := s.enqueueEmailJob(ctx, job); err != nil {
+	if err := s.enqueueEmailJob(ctx, job, idempotencyKey); err != nil {
 		log.Printf("failed to re-enqueue job: %v", err)
 	}
 }
