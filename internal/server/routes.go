@@ -18,7 +18,6 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -124,27 +123,19 @@ func (s *Server) RateLimitMiddleware(next http.Handler) http.Handler {
 		const maxAttempts = 2
 		ip := r.RemoteAddr
 		key := "rate_limit:" + ip
-		cnt, err := s.redis.Get(r.Context(), key).Int()
-		if err != nil && err != redis.Nil {
-			writeJSON(w, http.StatusInternalServerError, "server error")
-			return
-		}
 
-		inrCounter, err := s.redis.Incr(r.Context(), key).Result()
-		fmt.Printf("Counter Increment %d", inrCounter)
+		cnt, err := s.redis.Incr(r.Context(), key).Result()
+		fmt.Printf("Counter Increment %d", cnt)
 		if err != nil {
 			log.Println(err)
 			return
 		}
-		data := fmt.Sprintf("%s:%s",
-			ip,
-			"email_queue",
-		)
 
-		h := sha256.Sum256([]byte(data))
-		idempotencyKey := hex.EncodeToString(h[:])
-		if cnt > maxAttempts {
-			if cnt == maxAttempts+1 {
+		if cnt > int64(maxAttempts)+1 {
+			if cnt == int64(maxAttempts)+2 {
+				data := fmt.Sprintf("%s:%s", ip, "email_queue")
+				h := sha256.Sum256([]byte(data))
+				idempotencyKey := hex.EncodeToString(h[:])
 				go func() {
 					if err := s.enqueueEmailJob(context.Background(), EmailJob{IP: ip, Reason: "rate_limit"}, idempotencyKey); err != nil {
 						log.Printf("failed to enqueue email job: %v", err)
