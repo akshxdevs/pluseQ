@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strconv"
 	"time"
@@ -54,28 +55,29 @@ func (s *Server) enqueueEmailJob(ctx context.Context, job EmailJob, idemKey stri
 }
 
 func (s *Server) sendToDLQ(ctx context.Context, job EmailJob, reason string) {
-
 	dlq, err := s.redis.XAdd(ctx, &redis.XAddArgs{
 		Stream: emailDLQ,
 		Values: map[string]any{
-			"ip":        job.IP,
-			"reason":    job.Reason,
-			"attempts":  job.Attempts,
-			"failure":   reason,
-			"failed_at": time.Now().UTC().String(),
+			"ip":              job.IP,
+			"reason":          job.Reason,
+			"attempts":        job.Attempts,
+			"failure":         reason,
+			"idempotency_key": job.IdempotencyKey,
+			"failed_at":       time.Now().UTC().String(),
 		},
 	}).Result()
 	if err != nil {
 		log.Printf("failed to send job to DLQ: %v", err)
 		return
 	}
-	log.Printf("DLQ: %s", dlq)
-	log.Printf("job for ip %s sent to DLQ after %d attempts", job.IP, job.Attempts)
+	log.Printf("DLQ entry: %s | ip: %s | reason: %s | attempts: %d", dlq, job.IP, reason, job.Attempts)
+	log.Printf("ALERT: job failed permanently for ip %s after %d attempts: %s", job.IP, job.Attempts, reason)
 }
 
-func (s *Server) processEmailJob(job EmailJob) error {
+func (s *Server) processEmailJob(ctx context.Context, job EmailJob) error {
 	log.Printf("sending email for ip %s (attempt %d)", job.IP, job.Attempts)
-	return nil
+	log.Printf("ctx: %s", ctx)
+	return fmt.Errorf("email provider unreachable")
 }
 
 func (s *Server) StartWorker(ctx context.Context) {
@@ -120,11 +122,21 @@ func (s *Server) StartWorker(ctx context.Context) {
 
 func (s *Server) handleMessage(ctx context.Context, msg redis.XMessage) {
 	log.Println("message: ", msg)
-	attempts, _ := strconv.Atoi(msg.Values["attempts"].(string))
+
+	ip, ok := msg.Values["ip"].(string)
+	if !ok {
+		log.Printf("malformed message: missing ip field, msg_id=%s", msg.ID)
+		s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
+		return
+	}
+	reason, _ := msg.Values["reason"].(string)
+	attemptsStr, _ := msg.Values["attempts"].(string)
+	attempts, _ := strconv.Atoi(attemptsStr)
 	idempotencyKey, _ := msg.Values["idempotency_key"].(string)
+
 	job := EmailJob{
-		IP:             msg.Values["ip"].(string),
-		Reason:         msg.Values["reason"].(string),
+		IP:             ip,
+		Reason:         reason,
 		Attempts:       attempts + 1,
 		IdempotencyKey: idempotencyKey,
 	}
@@ -146,30 +158,33 @@ func (s *Server) handleMessage(ctx context.Context, msg redis.XMessage) {
 	}
 
 	go func() {
-		done <- s.processEmailJob(job)
+		done <- s.processEmailJob(jobTimeout, job)
 	}()
+
+	var failReason string
 
 	select {
 	case err := <-done:
 		if err == nil {
 			log.Printf("job done for ip %s, acking", job.IP)
-			log.Printf("idempotency: initialized with key: %s", idempotencyKey)
 			s.redis.Set(ctx, key, "1", 30*time.Second)
 			s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
 			return
 		}
+		failReason = err.Error()
 		log.Printf("job error for ip %s: %v", job.IP, err)
 	case <-jobTimeout.Done():
+		failReason = "timeout"
 		log.Printf("job timed out for ip %s (attempt %d/%d)", job.IP, job.Attempts, maxRetries)
 	}
 
+	s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
+
 	if job.Attempts >= maxRetries {
-		s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
-		s.sendToDLQ(ctx, job, "timeout or error")
+		s.sendToDLQ(ctx, job, failReason)
 		return
 	}
 
-	s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
 	if err := s.enqueueEmailJob(ctx, job, idempotencyKey); err != nil {
 		log.Printf("failed to re-enqueue job: %v", err)
 	}
