@@ -13,14 +13,14 @@ import (
 )
 
 const (
-	emailQueue      = "email:queue"
-	emailDLQ        = "email:dlq"
-	consumerGroup   = "email-workers"
-	consumerName    = "worker-1"
-	maxRetries      = 5
-	dedupTTL        = 60 * time.Second
-	jobStatusTTL    = 24 * time.Hour
-	maxConcurrency  = 10
+	emailQueue     = "email:queue"
+	emailDLQ       = "email:dlq"
+	consumerGroup  = "email-workers"
+	consumerName   = "worker-1"
+	maxRetries     = 5
+	dedupTTL       = 60 * time.Second
+	jobStatusTTL   = 24 * time.Hour
+	maxConcurrency = 10
 )
 
 const (
@@ -162,9 +162,10 @@ func (s *Server) ReplayDLQ(ctx context.Context) (int, error) {
 }
 
 func (s *Server) processEmailJob(ctx context.Context, job EmailJob) error {
+	// time.Sleep(50 * time.Second)
 	log.Printf("sending email for ip %s (attempt %d)", job.IP, job.Attempts)
 	log.Printf("ctx: %s", ctx)
-	return fmt.Errorf("email provider unreachable")
+	return nil
 }
 
 func (s *Server) StartWorker(ctx context.Context) {
