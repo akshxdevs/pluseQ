@@ -35,6 +35,11 @@ func (s *Server) RegisterRoutes() http.Handler {
 
 	r.Get("/", s.HelloWorldHandler)
 	r.With(s.RateLimitMiddleware).Post("/api/v1/user/login", s.Login)
+
+	r.Post("/jobs/enqueue", s.EnqueueJobHandler)
+	r.Post("/jobs/dlq/replay", s.DLQReplayHandler)
+	r.Get("/jobs/{id}/status", s.JobStatusHandler)
+
 	return r
 }
 
@@ -137,7 +142,7 @@ func (s *Server) RateLimitMiddleware(next http.Handler) http.Handler {
 				h := sha256.Sum256([]byte(data))
 				idempotencyKey := hex.EncodeToString(h[:])
 				go func() {
-					if err := s.enqueueEmailJob(context.Background(), EmailJob{IP: ip, Reason: "rate_limit"}, idempotencyKey); err != nil {
+					if _, err := s.enqueueEmailJob(context.Background(), EmailJob{IP: ip, Reason: "rate_limit"}, idempotencyKey); err != nil {
 						log.Printf("failed to enqueue email job: %v", err)
 					}
 				}()
@@ -166,6 +171,69 @@ func decodeJSONStrict(r *http.Request, v any) error {
 		return errors.New("invalid json payload")
 	}
 	return nil
+}
+
+func (s *Server) EnqueueJobHandler(w http.ResponseWriter, r *http.Request) {
+	type EnqueueRequest struct {
+		IP     string `json:"ip"`
+		Reason string `json:"reason"`
+	}
+
+	var req EnqueueRequest
+	if err := decodeJSONStrict(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json payload"})
+		return
+	}
+	if req.IP == "" || req.Reason == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ip and reason are required"})
+		return
+	}
+
+	job := EmailJob{IP: req.IP, Reason: req.Reason}
+
+	if s.CheckDuplicate(r.Context(), job) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "duplicate job"})
+		return
+	}
+
+	data := fmt.Sprintf("%s:%s", req.IP, req.Reason)
+	h := sha256.Sum256([]byte(data))
+	idemKey := hex.EncodeToString(h[:])
+
+	msgID, err := s.enqueueEmailJob(r.Context(), job, idemKey)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]string{"job_id": msgID})
+}
+
+func (s *Server) DLQReplayHandler(w http.ResponseWriter, r *http.Request) {
+	count, err := s.ReplayDLQ(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"replayed": count})
+}
+
+func (s *Server) JobStatusHandler(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing job id"})
+		return
+	}
+	status, err := s.redis.HGetAll(r.Context(), "job:status:"+id).Result()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(status) == 0 {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
