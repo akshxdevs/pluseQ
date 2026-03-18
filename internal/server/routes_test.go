@@ -4,17 +4,19 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 )
 
 func TestHandler(t *testing.T) {
-	s := &Server{}
+	s := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	server := httptest.NewServer(http.HandlerFunc(s.HelloWorldHandler))
 	defer server.Close()
 	resp, err := http.Get(server.URL)
@@ -48,7 +50,16 @@ func newTestRedis(t *testing.T) *redis.Client {
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
-	return &Server{redis: newTestRedis(t)}
+	rdb := newTestRedis(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := prometheus.NewRegistry()
+	return &Server{
+		redis:        rdb,
+		logger:       logger,
+		metrics:      NewMetrics(reg, rdb),
+		metricsReg:   reg,
+		consumerName: "test-worker",
+	}
 }
 
 // --- Job Status Tracking ---
