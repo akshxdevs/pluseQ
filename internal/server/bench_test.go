@@ -70,7 +70,10 @@ func TestMetricsEndpoint(t *testing.T) {
 
 	// trigger a counter so it appears, then verify
 	s.metrics.JobsEnqueued.WithLabelValues("test").Inc()
-	resp2, _ := http.Get(ts.URL + "/metrics")
+	resp2, err2 := http.Get(ts.URL + "/metrics")
+	if err2 != nil {
+		t.Fatalf("request failed: %v", err2)
+	}
 	defer resp2.Body.Close()
 	body2, _ := io.ReadAll(resp2.Body)
 	if !strings.Contains(string(body2), "pulseq_jobs_enqueued_total") {
@@ -231,8 +234,9 @@ func TestMultipleWorkerConsumers(t *testing.T) {
 	ctx := context.Background()
 	s.ensureConsumerGroup(ctx)
 
-	// enqueue some jobs
-	for i := 0; i < 20; i++ {
+	// enqueue jobs
+	const jobCount = 30
+	for i := 0; i < jobCount; i++ {
 		s.redis.XAdd(ctx, &redis.XAddArgs{
 			Stream: emailQueue,
 			Values: map[string]any{
@@ -244,25 +248,49 @@ func TestMultipleWorkerConsumers(t *testing.T) {
 		})
 	}
 
-	// verify consumer group info
-	groups, err := s.redis.XInfoGroups(ctx, emailQueue).Result()
-	if err != nil {
-		t.Fatalf("XInfoGroups failed: %v", err)
-	}
-	found := false
-	for _, g := range groups {
-		if g.Name == consumerGroup {
-			found = true
-			break
+	// simulate 3 consumers reading from the same group
+	consumerNames := []string{"worker-a", "worker-b", "worker-c"}
+	consumed := make(map[string]int)
+
+	for _, name := range consumerNames {
+		for {
+			streams, err := s.redis.XReadGroup(ctx, &redis.XReadGroupArgs{
+				Group:    consumerGroup,
+				Consumer: name,
+				Streams:  []string{emailQueue, ">"},
+				Count:    5,
+				Block:    100 * time.Millisecond,
+			}).Result()
+			if err != nil {
+				break
+			}
+			for _, stream := range streams {
+				consumed[name] += len(stream.Messages)
+				for _, msg := range stream.Messages {
+					s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
+				}
+			}
 		}
 	}
-	if !found {
-		t.Error("expected consumer group to exist")
+
+	// verify all jobs were consumed
+	total := 0
+	for name, count := range consumed {
+		t.Logf("consumer %s processed %d jobs", name, count)
+		total += count
+	}
+	if total != jobCount {
+		t.Errorf("expected %d total consumed, got %d", jobCount, total)
 	}
 
-	// verify pending entries via XINFO
-	pending, _ := s.redis.XPending(ctx, emailQueue, consumerGroup).Result()
-	t.Logf("pending count: %d", pending.Count)
+	// verify multiple consumers appear in XINFO
+	consumers, err := s.redis.XInfoConsumers(ctx, emailQueue, consumerGroup).Result()
+	if err != nil {
+		t.Fatalf("XInfoConsumers failed: %v", err)
+	}
+	if len(consumers) < 2 {
+		t.Errorf("expected at least 2 consumers registered, got %d", len(consumers))
+	}
 }
 
 // --- Benchmarks ---
