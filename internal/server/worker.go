@@ -5,8 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"log"
+	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -16,7 +17,6 @@ const (
 	emailQueue     = "email:queue"
 	emailDLQ       = "email:dlq"
 	consumerGroup  = "email-workers"
-	consumerName   = "worker-1"
 	maxRetries     = 5
 	dedupTTL       = 60 * time.Second
 	jobStatusTTL   = 24 * time.Hour
@@ -48,7 +48,7 @@ func (s *Server) setJobStatus(ctx context.Context, jobID, status, errMsg string)
 		fields["error"] = errMsg
 	}
 	if err := s.redis.HSet(ctx, key, fields).Err(); err != nil {
-		log.Printf("failed to set job status: %v", err)
+		s.logError(ctx, "job.status_update_failed", slog.String("job_id", jobID), slog.String("error", err.Error()))
 		return
 	}
 	s.redis.Expire(ctx, key, jobStatusTTL)
@@ -63,7 +63,7 @@ func dedupKey(job EmailJob) string {
 func (s *Server) CheckDuplicate(ctx context.Context, job EmailJob) bool {
 	ok, err := s.redis.SetNX(ctx, dedupKey(job), "1", dedupTTL).Result()
 	if err != nil {
-		log.Printf("dedup check error: %v", err)
+		s.logError(ctx, "dedup.check_failed", slog.String("error", err.Error()))
 		return false
 	}
 	return !ok
@@ -72,18 +72,18 @@ func (s *Server) CheckDuplicate(ctx context.Context, job EmailJob) bool {
 func (s *Server) ensureConsumerGroup(ctx context.Context) {
 	err := s.redis.XGroupCreateMkStream(ctx, emailQueue, consumerGroup, "0").Err()
 	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
-		log.Printf("failed to create consumer group: %v", err)
+		s.logError(ctx, "consumer_group.create_failed", slog.String("error", err.Error()))
 	}
 }
 
 func (s *Server) enqueueEmailJob(ctx context.Context, job EmailJob, idemKey string) (string, error) {
 	ok, err := s.redis.SetNX(ctx, "email:idempotency:"+job.IP, idemKey, time.Second*10).Result()
 	if err != nil {
-		log.Println("redis error: idempotency check failed")
+		s.logError(ctx, "enqueue.idempotency_failed", slog.String("ip", job.IP), slog.String("error", err.Error()))
 		return "", err
 	}
 	if !ok {
-		log.Println("error: idempotency check failed")
+		s.logInfo(ctx, "enqueue.idempotency_blocked", slog.String("ip", job.IP))
 		return "", nil
 	}
 
@@ -101,6 +101,17 @@ func (s *Server) enqueueEmailJob(ctx context.Context, job EmailJob, idemKey stri
 	}
 
 	s.setJobStatus(ctx, msgID, StatusPending, "")
+
+	if s.metrics != nil {
+		s.metrics.JobsEnqueued.WithLabelValues(job.Reason).Inc()
+	}
+
+	s.logInfo(ctx, "job.enqueued",
+		slog.String("job_id", msgID),
+		slog.String("ip", job.IP),
+		slog.String("reason", job.Reason),
+	)
+
 	return msgID, nil
 }
 
@@ -117,12 +128,22 @@ func (s *Server) sendToDLQ(ctx context.Context, job EmailJob, reason string) {
 		},
 	}).Result()
 	if err != nil {
-		log.Printf("failed to send job to DLQ: %v", err)
+		s.logError(ctx, "dlq.send_failed", slog.String("ip", job.IP), slog.String("error", err.Error()))
 		return
 	}
 	s.setJobStatus(ctx, job.ID, StatusFailed, reason)
-	log.Printf("DLQ entry: %s | ip: %s | reason: %s | attempts: %d", dlq, job.IP, reason, job.Attempts)
-	log.Printf("ALERT: job failed permanently for ip %s after %d attempts: %s", job.IP, job.Attempts, reason)
+
+	if s.metrics != nil {
+		s.metrics.JobsProcessed.WithLabelValues("dlq").Inc()
+	}
+
+	s.logError(ctx, "job.dlq",
+		slog.String("dlq_id", dlq),
+		slog.String("job_id", job.ID),
+		slog.String("ip", job.IP),
+		slog.String("failure", reason),
+		slog.Int("attempts", job.Attempts),
+	)
 }
 
 func (s *Server) ReplayDLQ(ctx context.Context) (int, error) {
@@ -146,11 +167,11 @@ func (s *Server) ReplayDLQ(ctx context.Context) (int, error) {
 
 		msgID, err := s.enqueueEmailJob(ctx, job, idemKey)
 		if err != nil {
-			log.Printf("failed to replay DLQ message %s: %v", msg.ID, err)
+			s.logError(ctx, "dlq.replay_failed", slog.String("dlq_msg_id", msg.ID), slog.String("error", err.Error()))
 			continue
 		}
 		if msgID == "" {
-			log.Printf("skipped replay for DLQ message %s: idempotency blocked", msg.ID)
+			s.logWarn(ctx, "dlq.replay_blocked", slog.String("dlq_msg_id", msg.ID))
 			continue
 		}
 
@@ -162,29 +183,44 @@ func (s *Server) ReplayDLQ(ctx context.Context) (int, error) {
 }
 
 func (s *Server) processEmailJob(ctx context.Context, job EmailJob) error {
-	// time.Sleep(50 * time.Second)
-	log.Printf("sending email for ip %s (attempt %d)", job.IP, job.Attempts)
-	log.Printf("ctx: %s", ctx)
+	s.logInfo(ctx, "job.executing",
+		slog.String("job_id", job.ID),
+		slog.String("ip", job.IP),
+		slog.Int("attempt", job.Attempts),
+	)
 	return nil
+}
+
+// parseStreamTimestamp extracts the millisecond timestamp from a Redis stream ID (format: "1234567890123-0")
+func parseStreamTimestamp(msgID string) (time.Time, bool) {
+	parts := strings.SplitN(msgID, "-", 2)
+	if len(parts) < 1 {
+		return time.Time{}, false
+	}
+	ms, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(ms), true
 }
 
 func (s *Server) StartWorker(ctx context.Context) {
 	s.ensureConsumerGroup(ctx)
-	log.Println("email worker started")
+	s.logInfo(ctx, "worker.started", slog.String("consumer", s.consumerName))
 
 	sem := make(chan struct{}, maxConcurrency)
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("email worker stopped")
+			s.logInfo(ctx, "worker.stopped", slog.String("consumer", s.consumerName))
 			return
 		default:
 		}
 
 		streams, err := s.redis.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    consumerGroup,
-			Consumer: consumerName,
+			Consumer: s.consumerName,
 			Streams:  []string{emailQueue, ">"},
 			Count:    1,
 			Block:    2 * time.Second,
@@ -197,12 +233,11 @@ func (s *Server) StartWorker(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("worker read error: %v", err)
+			s.logError(ctx, "worker.read_error", slog.String("error", err.Error()))
 			continue
 		}
 
 		for _, stream := range streams {
-			log.Println(len(stream.Stream))
 			for _, msg := range stream.Messages {
 				sem <- struct{}{}
 				go func(m redis.XMessage) {
@@ -219,11 +254,9 @@ func backoffDuration(attempt int) time.Duration {
 }
 
 func (s *Server) handleMessage(ctx context.Context, msg redis.XMessage) {
-	log.Println("message: ", msg)
-
 	ip, ok := msg.Values["ip"].(string)
 	if !ok {
-		log.Printf("malformed message: missing ip field, msg_id=%s", msg.ID)
+		s.logError(ctx, "job.malformed", slog.String("msg_id", msg.ID))
 		s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
 		return
 	}
@@ -240,10 +273,25 @@ func (s *Server) handleMessage(ctx context.Context, msg redis.XMessage) {
 		IdempotencyKey: idempotencyKey,
 	}
 
-	log.Printf("Attempts: %d", job.Attempts)
-	log.Println("job: ", job)
+	// queue latency: time from enqueue (stream ID timestamp) to now
+	if enqueueTime, ok := parseStreamTimestamp(msg.ID); ok && s.metrics != nil {
+		latency := time.Since(enqueueTime)
+		s.metrics.QueueLatency.WithLabelValues(reason).Observe(latency.Seconds())
+	}
+
+	if s.metrics != nil {
+		s.metrics.JobsInFlight.Inc()
+		defer s.metrics.JobsInFlight.Dec()
+	}
 
 	s.setJobStatus(ctx, msg.ID, StatusProcessing, "")
+	s.logInfo(ctx, "job.processing",
+		slog.String("job_id", msg.ID),
+		slog.String("ip", job.IP),
+		slog.Int("attempt", job.Attempts),
+	)
+
+	start := time.Now()
 
 	jobTimeout, cancel := context.WithTimeout(ctx, time.Second*30)
 	defer cancel()
@@ -254,7 +302,7 @@ func (s *Server) handleMessage(ctx context.Context, msg redis.XMessage) {
 	exist, _ := s.redis.Get(ctx, key).Result()
 	if exist == "1" {
 		s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
-		log.Println("error: idempotency error")
+		s.logWarn(ctx, "job.idempotency_skip", slog.String("job_id", msg.ID), slog.String("ip", job.IP))
 		return
 	}
 
@@ -267,17 +315,42 @@ func (s *Server) handleMessage(ctx context.Context, msg redis.XMessage) {
 	select {
 	case err := <-done:
 		if err == nil {
-			log.Printf("job done for ip %s, acking", job.IP)
+			duration := time.Since(start)
 			s.redis.Set(ctx, key, "1", 30*time.Second)
 			s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
 			s.setJobStatus(ctx, msg.ID, StatusCompleted, "")
+
+			if s.metrics != nil {
+				s.metrics.JobsProcessed.WithLabelValues("completed").Inc()
+				s.metrics.JobDuration.WithLabelValues("completed").Observe(duration.Seconds())
+			}
+
+			s.logInfo(ctx, "job.completed",
+				slog.String("job_id", msg.ID),
+				slog.String("ip", job.IP),
+				slog.Float64("duration_ms", float64(duration.Milliseconds())),
+			)
 			return
 		}
 		failReason = err.Error()
-		log.Printf("job error for ip %s: %v", job.IP, err)
+		s.logError(ctx, "job.error",
+			slog.String("job_id", msg.ID),
+			slog.String("ip", job.IP),
+			slog.String("error", failReason),
+		)
 	case <-jobTimeout.Done():
 		failReason = "timeout"
-		log.Printf("job timed out for ip %s (attempt %d/%d)", job.IP, job.Attempts, maxRetries)
+		s.logError(ctx, "job.timeout",
+			slog.String("job_id", msg.ID),
+			slog.String("ip", job.IP),
+			slog.Int("attempt", job.Attempts),
+		)
+	}
+
+	duration := time.Since(start)
+	if s.metrics != nil {
+		s.metrics.JobsProcessed.WithLabelValues("failed").Inc()
+		s.metrics.JobDuration.WithLabelValues("failed").Observe(duration.Seconds())
 	}
 
 	s.redis.XAck(ctx, emailQueue, consumerGroup, msg.ID)
@@ -289,7 +362,12 @@ func (s *Server) handleMessage(ctx context.Context, msg redis.XMessage) {
 
 	// exponential backoff: 1s, 2s, 4s, 8s, 16s
 	backoff := backoffDuration(job.Attempts)
-	log.Printf("backing off %v before retry for ip %s (attempt %d/%d)", backoff, job.IP, job.Attempts, maxRetries)
+	s.logWarn(ctx, "job.retry",
+		slog.String("job_id", msg.ID),
+		slog.String("ip", job.IP),
+		slog.Int("attempt", job.Attempts),
+		slog.Float64("backoff_s", backoff.Seconds()),
+	)
 	select {
 	case <-time.After(backoff):
 	case <-ctx.Done():
@@ -297,6 +375,6 @@ func (s *Server) handleMessage(ctx context.Context, msg redis.XMessage) {
 	}
 
 	if _, err := s.enqueueEmailJob(ctx, job, idempotencyKey); err != nil {
-		log.Printf("failed to re-enqueue job: %v", err)
+		s.logError(ctx, "job.reenqueue_failed", slog.String("job_id", msg.ID), slog.String("error", err.Error()))
 	}
 }
