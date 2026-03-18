@@ -6,9 +6,12 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 )
+
+const gaugeFuncTimeout = 500 * time.Millisecond
 
 type Metrics struct {
 	JobsEnqueued   *prometheus.CounterVec
@@ -42,7 +45,9 @@ func NewMetrics(reg prometheus.Registerer, rdb *redis.Client) *Metrics {
 			Name: "pulseq_queue_depth",
 			Help: "Number of messages in the main queue",
 		}, func() float64 {
-			n, err := rdb.XLen(context.Background(), emailQueue).Result()
+			ctx, cancel := context.WithTimeout(context.Background(), gaugeFuncTimeout)
+			defer cancel()
+			n, err := rdb.XLen(ctx, emailQueue).Result()
 			if err != nil {
 				return 0
 			}
@@ -53,7 +58,9 @@ func NewMetrics(reg prometheus.Registerer, rdb *redis.Client) *Metrics {
 			Name: "pulseq_dlq_depth",
 			Help: "Number of messages in the dead letter queue",
 		}, func() float64 {
-			n, err := rdb.XLen(context.Background(), emailDLQ).Result()
+			ctx, cancel := context.WithTimeout(context.Background(), gaugeFuncTimeout)
+			defer cancel()
+			n, err := rdb.XLen(ctx, emailDLQ).Result()
 			if err != nil {
 				return 0
 			}
@@ -103,6 +110,10 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
 func (s *Server) PrometheusMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.metrics == nil {
@@ -114,9 +125,15 @@ func (s *Server) PrometheusMiddleware(next http.Handler) http.Handler {
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(rw, r)
 
+		// use chi route pattern to avoid high-cardinality labels from path params
+		routePattern := "unknown"
+		if rctx := chi.RouteContext(r.Context()); rctx != nil && rctx.RoutePattern() != "" {
+			routePattern = rctx.RoutePattern()
+		}
+
 		s.metrics.HTTPRequestDur.WithLabelValues(
 			r.Method,
-			r.URL.Path,
+			routePattern,
 			strconv.Itoa(rw.statusCode),
 		).Observe(time.Since(start).Seconds())
 	})
