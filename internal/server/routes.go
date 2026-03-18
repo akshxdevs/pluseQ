@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"time"
@@ -18,12 +18,16 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/crypto/bcrypt"
 )
 
 func (s *Server) RegisterRoutes() http.Handler {
 	r := chi.NewRouter()
+
+	r.Use(s.CorrelationIDMiddleware)
 	r.Use(middleware.Logger)
+	r.Use(s.PrometheusMiddleware)
 
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"https://*", "http://*"},
@@ -32,6 +36,10 @@ func (s *Server) RegisterRoutes() http.Handler {
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
+
+	if s.metricsReg != nil {
+		r.Handle("/metrics", promhttp.HandlerFor(s.metricsReg, promhttp.HandlerOpts{}))
+	}
 
 	r.Get("/", s.HelloWorldHandler)
 	r.With(s.RateLimitMiddleware).Post("/api/v1/user/login", s.Login)
@@ -49,7 +57,8 @@ func (s *Server) HelloWorldHandler(w http.ResponseWriter, r *http.Request) {
 
 	jsonResp, err := json.Marshal(resp)
 	if err != nil {
-		log.Fatalf("error handling JSON marshal. Err: %v", err)
+		slog.Error("error handling JSON marshal", slog.String("error", err.Error()))
+		return
 	}
 
 	_, _ = w.Write(jsonResp)
@@ -105,14 +114,14 @@ func (s *Server) Login(w http.ResponseWriter, r *http.Request) {
 	}
 	sessionId := uuid.NewString()
 	s.redis.Set(r.Context(), "user_auth:"+sessionId, req.Id, time.Hour).Result()
-	log.Println("session stored in redis")
+	s.logInfo(r.Context(), "session.stored", slog.String("session_id", sessionId))
 
 	getId, err := s.redis.HGetAll(r.Context(), "user_auth").Result()
 	if err != nil {
 		panic(err)
 	}
 
-	log.Printf("user auth: %s", getId)
+	s.logInfo(r.Context(), "user.auth", slog.String("data", fmt.Sprintf("%v", getId)))
 
 	writeJSON(w, http.StatusAccepted, UserResponse{
 		Id:         req.Id,
@@ -130,9 +139,8 @@ func (s *Server) RateLimitMiddleware(next http.Handler) http.Handler {
 		key := "rate_limit:" + ip
 
 		cnt, err := s.redis.Incr(r.Context(), key).Result()
-		fmt.Printf("Counter Increment %d", cnt)
 		if err != nil {
-			log.Println(err)
+			s.logError(r.Context(), "rate_limit.incr_failed", slog.String("error", err.Error()))
 			return
 		}
 
@@ -143,7 +151,7 @@ func (s *Server) RateLimitMiddleware(next http.Handler) http.Handler {
 				idempotencyKey := hex.EncodeToString(h[:])
 				go func() {
 					if _, err := s.enqueueEmailJob(context.Background(), EmailJob{IP: ip, Reason: "rate_limit"}, idempotencyKey); err != nil {
-						log.Printf("failed to enqueue email job: %v", err)
+						s.logError(r.Context(), "rate_limit.enqueue_failed", slog.String("error", err.Error()))
 					}
 				}()
 			}
@@ -245,6 +253,6 @@ func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	if _, err := w.Write(body); err != nil {
-		log.Printf("Failed to write response: %v", err)
+		slog.Error("failed to write response", slog.String("error", err.Error()))
 	}
 }
