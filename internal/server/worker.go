@@ -328,7 +328,7 @@ func (s *Server) handleMessage(ctx context.Context, msg redis.XMessage) {
 			s.logInfo(ctx, "job.completed",
 				slog.String("job_id", msg.ID),
 				slog.String("ip", job.IP),
-				slog.Float64("duration_ms", float64(duration.Milliseconds())),
+				slog.Float64("duration_s", duration.Seconds()),
 			)
 			return
 		}
