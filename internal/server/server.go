@@ -3,13 +3,14 @@ package server
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
 
 	_ "github.com/joho/godotenv/autoload"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -17,21 +18,42 @@ type Server struct {
 	port         int
 	redis        *redis.Client
 	workerCancel context.CancelFunc
+	metrics      *Metrics
+	metricsReg   *prometheus.Registry
+	logger       *slog.Logger
+	consumerName string
 }
 
 func NewServer() (*http.Server, func()) {
 	port, _ := strconv.Atoi(os.Getenv("PORT"))
-	s := &Server{
-		port:  port,
-		redis: NewRedis(),
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+
+	rdb := NewRedis()
+
+	consumerName := os.Getenv("WORKER_NAME")
+	if consumerName == "" {
+		hostname, _ := os.Hostname()
+		consumerName = fmt.Sprintf("worker-%s-%d", hostname, os.Getpid())
 	}
 
-	// start worker with its own cancellable context
+	reg := prometheus.NewRegistry()
+
+	s := &Server{
+		port:         port,
+		redis:        rdb,
+		metrics:      NewMetrics(reg, rdb),
+		metricsReg:   reg,
+		logger:       logger,
+		consumerName: consumerName,
+	}
+
 	workerCtx, cancel := context.WithCancel(context.Background())
 	s.workerCancel = cancel
 	go s.StartWorker(workerCtx)
 
-	// Declare Server config
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", s.port),
 		Handler:      s.RegisterRoutes(),
@@ -43,7 +65,7 @@ func NewServer() (*http.Server, func()) {
 	cleanup := func() {
 		s.workerCancel()
 		if err := s.redis.Close(); err != nil {
-			log.Printf("error closing redis: %v", err)
+			logger.Error("error closing redis", slog.String("error", err.Error()))
 		}
 	}
 
