@@ -35,17 +35,19 @@ func (s *Server) CorrelationIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) logInfo(ctx context.Context, msg string, args ...any) {
-	args = append(args, slog.String("correlation_id", CorrelationIDFromContext(ctx)))
-	s.logger.Info(msg, args...)
+func (s *Server) logAttrs(ctx context.Context, level slog.Level, msg string, attrs ...slog.Attr) {
+	attrs = append(attrs, slog.String("correlation_id", CorrelationIDFromContext(ctx)))
+	s.logger.LogAttrs(ctx, level, msg, attrs...)
 }
 
-func (s *Server) logWarn(ctx context.Context, msg string, args ...any) {
-	args = append(args, slog.String("correlation_id", CorrelationIDFromContext(ctx)))
-	s.logger.Warn(msg, args...)
+func (s *Server) logInfo(ctx context.Context, msg string, attrs ...slog.Attr) {
+	s.logAttrs(ctx, slog.LevelInfo, msg, attrs...)
 }
 
-func (s *Server) logError(ctx context.Context, msg string, args ...any) {
-	args = append(args, slog.String("correlation_id", CorrelationIDFromContext(ctx)))
-	s.logger.Error(msg, args...)
+func (s *Server) logWarn(ctx context.Context, msg string, attrs ...slog.Attr) {
+	s.logAttrs(ctx, slog.LevelWarn, msg, attrs...)
+}
+
+func (s *Server) logError(ctx context.Context, msg string, attrs ...slog.Attr) {
+	s.logAttrs(ctx, slog.LevelError, msg, attrs...)
 }
