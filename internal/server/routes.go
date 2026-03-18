@@ -149,9 +149,11 @@ func (s *Server) RateLimitMiddleware(next http.Handler) http.Handler {
 				data := fmt.Sprintf("%s:%s", ip, "email_queue")
 				h := sha256.Sum256([]byte(data))
 				idempotencyKey := hex.EncodeToString(h[:])
+				// capture correlation ID before spawning goroutine since r.Context() may be cancelled
+				logCtx := withCorrelationID(context.Background(), CorrelationIDFromContext(r.Context()))
 				go func() {
-					if _, err := s.enqueueEmailJob(context.Background(), EmailJob{IP: ip, Reason: "rate_limit"}, idempotencyKey); err != nil {
-						s.logError(r.Context(), "rate_limit.enqueue_failed", slog.String("error", err.Error()))
+					if _, err := s.enqueueEmailJob(logCtx, EmailJob{IP: ip, Reason: "rate_limit"}, idempotencyKey); err != nil {
+						s.logError(logCtx, "rate_limit.enqueue_failed", slog.String("error", err.Error()))
 					}
 				}()
 			}
