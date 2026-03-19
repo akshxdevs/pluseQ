@@ -30,7 +30,7 @@
 <br />
 <div align="center">
   <a href="https://github.com/akshxdevs/pluse-q">
-    <img src="images/logo.svg" alt="Logo" width="120" height="120">
+    <img src="./images/logo.svg" alt="pluse-q logo" width="120" height="120">
   </a>
 
   <h3 align="center">pluse-q</h3>
@@ -417,7 +417,7 @@ Don't forget to give the project a star! Thanks again!
 <!-- LICENSE -->
 ## License
 
-Distributed under the MIT License.
+Licensed under the [MIT License](LICENSE).
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -461,7 +461,7 @@ Project Link: [https://github.com/akshxdevs/pluse-q](https://github.com/akshxdev
 [issues-shield]: https://img.shields.io/github/issues/akshxdevs/pluse-q.svg?style=for-the-badge
 [issues-url]: https://github.com/akshxdevs/pluse-q/issues
 [license-shield]: https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge
-[license-url]: https://github.com/akshxdevs/pluse-q/blob/main/LICENSE.txt
+[license-url]: https://github.com/akshxdevs/pluse-q/blob/main/LICENSE
 [linkedin-shield]: https://img.shields.io/badge/-LinkedIn-black.svg?style=for-the-badge&logo=linkedin&colorB=555
 [linkedin-url]: https://linkedin.com/in/othneildrew
 [Go-badge]: https://img.shields.io/badge/Go-00ADD8?style=for-the-badge&logo=go&logoColor=white
